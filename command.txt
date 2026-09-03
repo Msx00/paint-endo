@@ -1,0 +1,253 @@
+已在当前 GTCom 工程中加入独立的 `reobsdiff` 方法；原监督训练和推理入口保持兼容。完成了 50 帧真实数据缓存、100-step SD1.5 LoRA debug 训练、泄露审计及单元测试。
+
+## 1. 原 GTCom 结构
+
+- `prepare_scene.py`：E2-L + E2 depth → E1 camera warp、几何 mask。
+- `stereocom/warp.py`：backprojection、camera transform、bilinear splat、z-buffer、confidence。
+- `stereocom/training_data.py`：原 supervised dataset 显式读取 E1-L target。
+- `train_supervised_lora.py`：E1 GT 监督 rank-16 SD1.5 Inpainting LoRA。
+- `infer_lcm.py`：LCM 四步补全与 known-pixel hard composition。
+- `evaluate_metrics.py`：E1 GT 的 PSNR、SSIM、LPIPS。
+- `train_endoscopy_lora.py`：旧的随机 mask 自监督入口，不属于新几何方法。
+
+仓库中未找到需求提到的 `report_task2.pdf`。
+
+## 2. 新增与修改
+
+主要入口：
+
+- [配置](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/configs/reobsdiff.yaml>)
+- [缓存构建](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/scripts/build_reobs_cache.py>)
+- [训练入口](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/scripts/train_reobsdiff.py>)
+- [推理入口](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/scripts/infer_reobsdiff.py>)
+- [内部指标](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/scripts/evaluate_reobsdiff.py>)
+- [泄露审计](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/scripts/audit_target_leakage.py>)
+- [测试](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/tests/test_reobsdiff.py>)
+- [使用说明](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/REOBSDIFF.md>)
+
+核心实现：
+
+- [统一 warp 接口](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/geometry/warp.py:7>)
+- [reciprocal corruption](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/geometry/reciprocal.py>)
+- [GT/FoundationStereo provider](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/depth/provider.py>)
+- [pose sampler](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/pose/reobservable_sampler.py:15>)
+- [re-observation 融合](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/reobs/target_builder.py:7>)
+- [训练 dataset](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/datasets/reobs_dataset.py:11>)
+- [loss/x0 prediction](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/diffusion/losses.py>)
+- [fail-closed 泄露检查](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/reobsdiff/leakage.py:13>)
+
+另外给原 [infer_lcm.py](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/infer_lcm.py:101>) 增加了 hard-composition 消融开关，默认行为没有改变。
+
+## 3. 新数据流
+
+```text
+E2-L RGB + E2 depth + E2 geometry
+    ↓
+候选 Tv 采样与 overlap/hole/reobs 筛选
+    ├─ Branch A
+    │   E2 → Tv → E2
+    │   → reciprocal holes
+    │   → SD1.5 noise prediction L_diff_self
+    │
+    └─ Branch B
+        E2 anchor → Tv
+        neighbors → 同一 Tv
+        → depth/occlusion/photometric filtering
+        → robust weighted re-observation
+        → timestep x0 prediction
+        → L_reobs + L_known
+```
+
+推理仍为单帧：
+
+```text
+E2 → E1 pose warp → geometry mask → ReObsDiff LoRA → hard composition
+```
+
+## 4. Tensor shape
+
+| Tensor | Shape |
+|---|---|
+| RGB、prediction | `[B,3,H,W]` |
+| depth/mask/confidence | `[B,1,H,W]` |
+| pose | `[B,4,4]` |
+| SD latent | `[B,4,H/8,W/8]` |
+| latent inpaint input | `[B,9,H/8,W/8]` |
+| observation count | cache 中 `[H,W]`，dataset 中 `[1,H,W]` |
+| source index map | `[H,W]` |
+
+## 5. Loss
+
+代码位于 [train_reobsdiff.py:131](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/scripts/train_reobsdiff.py:131>)。
+
+\[
+L_{\mathrm{diff}}=
+\frac{\sum (1+\lambda_mM+\lambda_bB)
+\lVert\epsilon-\epsilon_\theta\rVert^2}
+{\sum(1+\lambda_mM+\lambda_bB)}
+\]
+
+并应用 Min-SNR gamma=5。
+
+\[
+\hat{x}_0 =
+\frac{x_t-\sqrt{1-\bar\alpha_t}\epsilon_\theta}
+{\sqrt{\bar\alpha_t}}
+\]
+
+\[
+L_{\mathrm{reobs,rgb}}=
+\frac{\sum MC\sqrt{(I_{\mathrm{pred}}-I_{\mathrm{reobs}})^2+10^{-6}}}
+{\sum MC+\epsilon}
+\]
+
+\[
+L_{\mathrm{reobs}} =
+L_{\mathrm{reobs,rgb}}+\lambda_{\mathrm{grad}}L_{\mathrm{Sobel}}
+\]
+
+\[
+L_{\mathrm{known}} =
+\operatorname{mean}_{1-M}|I_{\mathrm{pred}}-W_v|
+\]
+
+\[
+L =
+L_{\mathrm{diff}}+\lambda_rL_{\mathrm{reobs}}
++\lambda_kL_{\mathrm{known}}
+\]
+
+## 6. 命令
+
+GT-depth cache 验证：
+
+```bash
+conda run --no-capture-output -n foundation_stereo \
+python scripts/build_reobs_cache.py \
+  --scene /path/to/session \
+  --output cache/session \
+  --config configs/reobsdiff.yaml \
+  --set depth_source=gt \
+  --resume
+```
+
+FoundationStereo 模式会严格读取预生成的 metric-depth cache，训练 epoch 内不会执行模型：
+
+```bash
+python scripts/build_reobs_cache.py \
+  --scene /path/to/session \
+  --output cache/session \
+  --config configs/reobsdiff.yaml \
+  --resume
+```
+
+训练：
+
+```bash
+conda run --no-capture-output -n foundation_stereo \
+python scripts/train_reobsdiff.py \
+  --cache cache/session \
+  --config configs/reobsdiff.yaml \
+  --output models/reobsdiff-lora \
+  --steps 5000
+```
+
+推理：
+
+```bash
+python scripts/infer_reobsdiff.py \
+  --input output/scene/warps \
+  --output output/scene/reobsdiff \
+  --lora models/reobsdiff-lora
+```
+
+泄露检查：
+
+```bash
+python scripts/audit_target_leakage.py \
+  --cache cache/session \
+  --training-output models/reobsdiff-lora
+```
+
+## 7. 实际验证结果
+
+- Syntax check：PASS
+- Import test：PASS
+- Baseline train/inference 入口：PASS
+- 单元测试：5/5 PASS
+- Identity warp：PASS
+- 小平移 border holes：PASS
+- Reciprocal geometry mask：PASS
+- Re-observation projection：PASS
+- Leakage failure test：PASS
+- 最终审计：`TARGET_VIEW_LEAKAGE_CHECK: PASS`
+- 50 帧：50 成功，0 skip
+- 平均 hole ratio：0.139801
+- 平均 overlap：0.860199
+- 实际 reobs coverage：平均 0.229715，范围 0.119226–0.979920
+- LoRA：256/256 tensor 非零，确认发生参数更新
+
+本次 cache 为加速 sanity check 使用 `128×160`、GT E2 depth 和放宽后的 `MIN_REOBS_RATIO=0.05`。
+
+100-step 平均 loss：
+
+| Loss | Mean | Step 100 |
+|---|---:|---:|
+| total | 0.471090 | 0.287357 |
+| diffusion self | 0.145510 | 0.111652 |
+| reobs RGB | 0.289366 | 0.148438 |
+| reobs gradient | 0.213141 | 0.152710 |
+| known | 0.149047 | 0.120056 |
+
+训练产物：[debug/train_100](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/debug/train_100>)
+
+## 8. 五组可视化
+
+- [frame 000002](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/debug/reobsdiff_50/visualizations/frame_000002>)
+- [frame 000005](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/debug/reobsdiff_50/visualizations/frame_000005>)
+- [frame 000008](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/debug/reobsdiff_50/visualizations/frame_000008>)
+- [frame 000011](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/debug/reobsdiff_50/visualizations/frame_000011>)
+- [frame 000014](</home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering/debug/reobsdiff_50/visualizations/frame_000014>)
+
+每组包含 anchor、virtual warp、hole、reciprocal corruption、reobs RGB/mask/confidence、hard composition 和三色 support overlay。
+
+## 9. 尚未解决
+
+- 当前发布数据有 E2-R RGB/K，但没有 E2-R 外参及 depthR。代码不会假设错误标定，因此本次实测是 temporal re-observation，`stereo_used=false`。完整 A5 stereo 需要补充可信的右目外参和右目深度/左右重投影关系。
+- 本次没有实际生成 FoundationStereo metric-depth cache，debug 使用 E2 GT depth。
+- 数据只有静态相机外参，没有逐帧位姿或 scene flow；当前 temporal provider 是 rigid V1。
+- 尚未跑完整 512×640/full-dataset 训练及 E1 PSNR/SSIM/LPIPS。
+- cache 中第 05 图是训练前占位诊断，不是训练后 diffusion validation prediction；固定验证集的逐 epoch 生成仍需补充。
+
+
+## 10. 训练+推理代码
+
+cd /home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering
+
+cd /home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering
+
+conda run --no-capture-output -n foundation_stereo \
+python scripts/build_reobs_cache.py \
+  --scene /home/data/mashixing/dataset_8tb/iMed/datasets/task2-nvs/session_007_scene_11_tool_3 \
+  --output cache/session_007_scene_11_tool_3 \
+  --config configs/reobsdiff.yaml \
+  --set depth_source=gt \
+  --resume \
+  --visualizations 5
+
+
+
+
+
+cd /home/data/mashixing/dataset_8tb/iMed/comparison/task2/crose_endo_rendering
+
+conda run --no-capture-output -n foundation_stereo \
+python scripts/infer_reobsdiff.py \
+  --input output/session_007_scene_11_tool_3/warps \
+  --output debug/reobsdiff_e1_completion \
+  --lora debug/train_100 \
+  --model models/sd15-inpainting \
+  --lcm-lora models/lcm-lora-sdv1-5 \
+  --max-frames 5 \
+  --config configs/reobsdiff.yaml \
+  --set depth_source=gt

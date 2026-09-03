@@ -1,0 +1,26 @@
+# Python build and cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local environments and editor files
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Downloaded model weights and training artifacts
+models/
+cache/
+output/
+debug/
+checkpoints/
+runs/
+wandb/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
