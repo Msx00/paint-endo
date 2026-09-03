@@ -89,8 +89,11 @@ def per_sample_reobs_losses(prediction, target, mask, confidence, gradient_weigh
 
 
 def reobs_coverage_weights(reobs_mask, hole_mask, low, high):
-    reobserved = reobs_mask.float().flatten(1).sum(1)
-    holes = hole_mask.float().flatten(1).sum(1).clamp_min(1)
+    hole_mask = hole_mask.float()
+    # Count only re-observations that lie inside the original geometric hole.
+    # The inpainting mask may be dilated and must not be used as denominator.
+    reobserved = (reobs_mask.float() * hole_mask).flatten(1).sum(1)
+    holes = hole_mask.flatten(1).sum(1).clamp_min(1)
     coverage = (reobserved / holes).clamp(0, 1)
     weight = ((coverage - low) / (high - low)).clamp(0, 1)
     return coverage, weight
@@ -113,14 +116,23 @@ def main():
     parser.add_argument("--lambda-e2", type=float, default=0.5,
                         help="weight for dense reciprocal E2 reconstruction")
     parser.add_argument("--e2-gradient-weight", type=float, default=0.1)
+    parser.add_argument("--e2-boundary-weight", type=float, default=0.5)
     parser.add_argument("--e2-ssim-weight", type=float, default=0.1)
+    parser.add_argument("--e2-known-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--e2-recon-max-timestep", type=int, default=400,
+        help="maximum diffusion timestep used for dense E2 x0 reconstruction supervision")
     parser.add_argument("--reobs-coverage-low", type=float, default=0.10,
                         help="coverage at or below this value receives no ReObs loss")
     parser.add_argument("--reobs-coverage-high", type=float, default=0.40,
                         help="coverage at or above this value receives full ReObs loss")
     args = parser.parse_args()
-    if args.lambda_e2 < 0 or args.e2_gradient_weight < 0 or args.e2_ssim_weight < 0:
+    if any(weight < 0 for weight in (
+            args.lambda_e2, args.e2_gradient_weight, args.e2_boundary_weight,
+            args.e2_ssim_weight, args.e2_known_weight)):
         parser.error("E2 reconstruction weights must be non-negative")
+    if args.e2_recon_max_timestep < 0:
+        parser.error("--e2-recon-max-timestep must be >= 0")
     if not 0 <= args.reobs_coverage_low < args.reobs_coverage_high <= 1:
         parser.error("ReObs coverage thresholds must satisfy 0 <= low < high <= 1")
     cfg = load_config(args.config, args.set)
@@ -167,7 +179,10 @@ def main():
                   "dense_e2_reconstruction": {
                       "weight": args.lambda_e2,
                       "gradient_weight": args.e2_gradient_weight,
+                      "boundary_weight": args.e2_boundary_weight,
                       "ssim_weight": args.e2_ssim_weight,
+                      "known_weight": args.e2_known_weight,
+                      "max_timestep": args.e2_recon_max_timestep,
                   },
                   "reobs_coverage_weighting": {
                       "low": args.reobs_coverage_low,
@@ -189,6 +204,8 @@ def main():
                 recip_boundary = batch["reciprocal_boundary"].to(accelerator.device, dtype=dtype)
                 virtual = batch["virtual_warp"].to(accelerator.device, dtype=dtype)
                 virtual_mask = batch["virtual_mask"].to(accelerator.device, dtype=dtype)
+                virtual_valid = batch["virtual_valid"].to(accelerator.device, dtype=dtype)
+                geometric_hole = 1.0 - virtual_valid
                 reobs_rgb = batch["reobs_rgb"].to(accelerator.device, dtype=dtype)
                 reobs_mask = batch["reobs_mask"].to(accelerator.device, dtype=dtype)
                 reobs_conf = batch["reobs_confidence"].to(accelerator.device, dtype=dtype)
@@ -211,22 +228,37 @@ def main():
                     per_sample *= min_snr_weight(scheduler, times_a, cfg.snr_gamma)
                 loss_diff = per_sample.mean() if cfg.use_reciprocal_training else pred_a.sum() * 0
                 if cfg.use_reciprocal_training and args.lambda_e2 > 0:
-                    e2_x0 = predict_x0(noisy_a, pred_a, times_a, scheduler)
+                    noisy_e2, pred_e2, _, times_e2 = model_pass(
+                        unet, scheduler, anchor_z, reciprocal_z, latent_recip_mask, emb,
+                        args.e2_recon_max_timestep)
+                    e2_x0 = predict_x0(noisy_e2, pred_e2, times_e2, scheduler)
                     e2_x0 = e2_x0.clamp(-cfg.x0_latent_clip, cfg.x0_latent_clip)
                     e2_prediction = vae.decode(
                         (e2_x0 / vae.config.scaling_factor).to(dtype=dtype)
                     ).sample.clamp(-1, 1)
-                    dense_mask = torch.ones_like(reciprocal_mask)
-                    loss_e2_rgb = charbonnier_loss(e2_prediction, anchor, dense_mask)
-                    loss_e2_grad = sobel_loss(e2_prediction, anchor, dense_mask)
+                    e2_hole_mask = reciprocal_mask
+                    known_mask = 1.0 - reciprocal_mask
+                    loss_e2_rgb_hole = charbonnier_loss(
+                        e2_prediction, anchor, e2_hole_mask)
+                    loss_e2_grad_hole = sobel_loss(
+                        e2_prediction, anchor, e2_hole_mask)
+                    loss_e2_boundary = charbonnier_loss(
+                        e2_prediction, anchor, recip_boundary)
                     loss_e2_ssim = ssim_loss(e2_prediction, anchor)
-                    loss_e2 = (loss_e2_rgb
-                               + args.e2_gradient_weight * loss_e2_grad
+                    loss_e2_known = charbonnier_loss(
+                        e2_prediction, anchor, known_mask)
+                    loss_e2 = (loss_e2_rgb_hole
+                               + args.e2_gradient_weight * loss_e2_grad_hole
+                               + args.e2_boundary_weight * loss_e2_boundary
                                + args.e2_ssim_weight * loss_e2_ssim)
+                    loss_e2 = loss_e2 + args.e2_known_weight * loss_e2_known
                 else:
-                    loss_e2_rgb = pred_a.sum() * 0
-                    loss_e2_grad = pred_a.sum() * 0
+                    times_e2 = times_a.new_full(times_a.shape, -1)
+                    loss_e2_rgb_hole = pred_a.sum() * 0
+                    loss_e2_grad_hole = pred_a.sum() * 0
+                    loss_e2_boundary = pred_a.sum() * 0
                     loss_e2_ssim = pred_a.sum() * 0
+                    loss_e2_known = pred_a.sum() * 0
                     loss_e2 = pred_a.sum() * 0
                 latent_virtual_mask = F.interpolate(virtual_mask, virtual_z.shape[-2:], mode="nearest")
                 noisy_b, pred_b, _, times_b = model_pass(
@@ -238,7 +270,7 @@ def main():
                 loss_rgb_samples, loss_grad_samples, loss_reobs_samples = per_sample_reobs_losses(
                     prediction, reobs_rgb, reobs_mask, reobs_conf, cfg.lambda_grad)
                 coverage, coverage_weight = reobs_coverage_weights(
-                    reobs_mask, virtual_mask,
+                    reobs_mask, geometric_hole,
                     args.reobs_coverage_low, args.reobs_coverage_high)
                 loss_rgb, loss_grad = loss_rgb_samples.mean(), loss_grad_samples.mean()
                 loss_reobs = (coverage_weight * loss_reobs_samples).mean()
@@ -251,8 +283,10 @@ def main():
                         + cfg.lambda_reobs * loss_reobs + cfg.lambda_known * loss_known)
                 components = {
                     "loss_total": loss, "loss_diff_self": loss_diff,
-                    "loss_e2_exact": loss_e2, "loss_e2_rgb": loss_e2_rgb,
-                    "loss_e2_grad": loss_e2_grad, "loss_e2_ssim": loss_e2_ssim,
+                    "loss_e2_exact": loss_e2, "loss_e2_rgb_hole": loss_e2_rgb_hole,
+                    "loss_e2_grad_hole": loss_e2_grad_hole,
+                    "loss_e2_boundary": loss_e2_boundary,
+                    "loss_e2_ssim": loss_e2_ssim, "loss_e2_known": loss_e2_known,
                     "loss_reobs_rgb": loss_rgb, "loss_reobs_grad": loss_grad,
                     "loss_reobs_weighted": loss_reobs,
                     "loss_known": loss_known,
@@ -261,9 +295,11 @@ def main():
                        if not bool(torch.isfinite(value.detach()).all())]
                 if bad:
                     raise FloatingPointError(
-                        "non-finite {} at optimizer step {}; reobs timesteps={}, "
+                        "non-finite {} at optimizer step {}; diffusion timesteps={}, "
+                        "E2 timesteps={}, reobs timesteps={}, "
                         "x0_abs_max={:.6g}, prediction_finite={}".format(
-                            ",".join(bad), step + 1, times_b.detach().cpu().tolist(),
+                            ",".join(bad), step + 1, times_a.detach().cpu().tolist(),
+                            times_e2.detach().cpu().tolist(), times_b.detach().cpu().tolist(),
                             float(x0.detach().abs().max()),
                             bool(torch.isfinite(prediction.detach()).all())))
                 accelerator.backward(loss)
@@ -274,12 +310,22 @@ def main():
                 step += 1
                 metrics = {"loss_total": float(loss.detach()), "loss_diff_self": float(loss_diff.detach()),
                     "loss_e2_exact": float(loss_e2.detach()),
-                    "loss_e2_rgb": float(loss_e2_rgb.detach()),
-                    "loss_e2_grad": float(loss_e2_grad.detach()),
+                    "loss_e2_rgb_hole": float(loss_e2_rgb_hole.detach()),
+                    "loss_e2_grad_hole": float(loss_e2_grad_hole.detach()),
+                    "loss_e2_boundary": float(loss_e2_boundary.detach()),
                     "loss_e2_ssim": float(loss_e2_ssim.detach()),
+                    "loss_e2_known": float(loss_e2_known.detach()),
+                    # Backward-compatible aliases for existing dashboards.
+                    "loss_e2_rgb": float(loss_e2_rgb_hole.detach()),
+                    "loss_e2_grad": float(loss_e2_grad_hole.detach()),
                     "loss_reobs_rgb": float(loss_rgb.detach()), "loss_reobs_grad": float(loss_grad.detach()),
                     "loss_reobs_weighted": float(loss_reobs.detach()),
                     "loss_known": float(loss_known.detach()),
+                    "diffusion_timestep_max": int(times_a.max().detach()),
+                    "e2_recon_timestep_max": int(times_e2.max().detach()),
+                    "e2_hole_ratio": float(reciprocal_mask.float().mean().detach()),
+                    "geometric_hole_ratio": float(geometric_hole.float().mean().detach()),
+                    "virtual_inpaint_mask_ratio": float(virtual_mask.float().mean().detach()),
                     "reobs_coverage": float(coverage.mean().detach()),
                     "reobs_coverage_weight": float(coverage_weight.mean().detach()),
                     "reobs_timestep_max": int(times_b.max().detach()),
