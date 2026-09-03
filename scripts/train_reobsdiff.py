@@ -53,6 +53,49 @@ def model_pass(unet, scheduler, clean_latents, condition_latents, mask, embeddin
     return noisy, prediction, target, timesteps
 
 
+def ssim_loss(prediction, target, window_size=11):
+    """Dense SSIM loss for RGB tensors normalized to [-1, 1]."""
+    prediction, target = prediction.float(), target.float()
+    padding = window_size // 2
+    mean_prediction = F.avg_pool2d(prediction, window_size, stride=1, padding=padding)
+    mean_target = F.avg_pool2d(target, window_size, stride=1, padding=padding)
+    prediction_variance = F.avg_pool2d(
+        prediction.square(), window_size, stride=1, padding=padding) - mean_prediction.square()
+    target_variance = F.avg_pool2d(
+        target.square(), window_size, stride=1, padding=padding) - mean_target.square()
+    covariance = F.avg_pool2d(
+        prediction * target, window_size, stride=1, padding=padding
+    ) - mean_prediction * mean_target
+    # Images use a dynamic range of two after normalization to [-1, 1].
+    c1, c2 = (0.01 * 2) ** 2, (0.03 * 2) ** 2
+    score = ((2 * mean_prediction * mean_target + c1) * (2 * covariance + c2)) / (
+        (mean_prediction.square() + mean_target.square() + c1)
+        * (prediction_variance + target_variance + c2)
+    ).clamp_min(1e-8)
+    return (1 - score.clamp(-1, 1)).mean()
+
+
+def per_sample_reobs_losses(prediction, target, mask, confidence, gradient_weight):
+    """Keep coverage weights sample-specific when batch size is greater than one."""
+    rgb, gradient = [], []
+    for index in range(prediction.shape[0]):
+        sample = slice(index, index + 1)
+        rgb.append(charbonnier_loss(
+            prediction[sample], target[sample], mask[sample], confidence[sample]))
+        gradient.append(sobel_loss(
+            prediction[sample], target[sample], mask[sample], confidence[sample]))
+    rgb, gradient = torch.stack(rgb), torch.stack(gradient)
+    return rgb, gradient, rgb + gradient_weight * gradient
+
+
+def reobs_coverage_weights(reobs_mask, hole_mask, low, high):
+    reobserved = reobs_mask.float().flatten(1).sum(1)
+    holes = hole_mask.float().flatten(1).sum(1).clamp_min(1)
+    coverage = (reobserved / holes).clamp(0, 1)
+    weight = ((coverage - low) / (high - low)).clamp(0, 1)
+    return coverage, weight
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", required=True)
@@ -67,7 +110,19 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--lambda-e2", type=float, default=0.5,
+                        help="weight for dense reciprocal E2 reconstruction")
+    parser.add_argument("--e2-gradient-weight", type=float, default=0.1)
+    parser.add_argument("--e2-ssim-weight", type=float, default=0.1)
+    parser.add_argument("--reobs-coverage-low", type=float, default=0.10,
+                        help="coverage at or below this value receives no ReObs loss")
+    parser.add_argument("--reobs-coverage-high", type=float, default=0.40,
+                        help="coverage at or above this value receives full ReObs loss")
     args = parser.parse_args()
+    if args.lambda_e2 < 0 or args.e2_gradient_weight < 0 or args.e2_ssim_weight < 0:
+        parser.error("E2 reconstruction weights must be non-negative")
+    if not 0 <= args.reobs_coverage_low < args.reobs_coverage_high <= 1:
+        parser.error("ReObs coverage thresholds must satisfy 0 <= low < high <= 1")
     cfg = load_config(args.config, args.set)
     assert_no_target_view(vars(args), "training arguments")
     os.environ.setdefault("NCCL_P2P_DISABLE", "1")
@@ -109,6 +164,15 @@ def main():
                   "target_view_rgb_reads": 0, "target_view_depth_reads": 0,
                   "steps": args.steps, "global_batch_size": effective,
                   "training_scenes": base.scenes, "training_frames": len(base),
+                  "dense_e2_reconstruction": {
+                      "weight": args.lambda_e2,
+                      "gradient_weight": args.e2_gradient_weight,
+                      "ssim_weight": args.e2_ssim_weight,
+                  },
+                  "reobs_coverage_weighting": {
+                      "low": args.reobs_coverage_low,
+                      "high": args.reobs_coverage_high,
+                  },
                   "config": cfg.to_dict()}
     assert_no_target_view(run_config, "training config")
     if accelerator.is_main_process:
@@ -131,10 +195,13 @@ def main():
                 with torch.no_grad():
                     anchor_z, reciprocal_z = encode(vae, anchor), encode(vae, reciprocal * (1 - reciprocal_mask))
                     virtual_z = encode(vae, virtual)
+                    # Match SD inpainting inference: mask pixels before VAE
+                    # encoding, rather than erasing already-mixed latents.
+                    virtual_condition_z = encode(vae, virtual * (1 - virtual_mask))
                 emb = prompt.expand(anchor.shape[0], -1, -1)
                 latent_recip_mask = F.interpolate(reciprocal_mask, anchor_z.shape[-2:], mode="nearest")
                 latent_boundary = F.interpolate(recip_boundary, anchor_z.shape[-2:], mode="nearest")
-                _, pred_a, noise_target, times_a = model_pass(
+                noisy_a, pred_a, noise_target, times_a = model_pass(
                     unet, scheduler, anchor_z, reciprocal_z, latent_recip_mask, emb)
                 weight = 1 + cfg.lambda_mask * latent_recip_mask + cfg.lambda_boundary * latent_boundary
                 weighted_error = (pred_a.float() - noise_target.float()).square() * weight.float()
@@ -143,25 +210,51 @@ def main():
                 if cfg.snr_gamma > 0:
                     per_sample *= min_snr_weight(scheduler, times_a, cfg.snr_gamma)
                 loss_diff = per_sample.mean() if cfg.use_reciprocal_training else pred_a.sum() * 0
+                if cfg.use_reciprocal_training and args.lambda_e2 > 0:
+                    e2_x0 = predict_x0(noisy_a, pred_a, times_a, scheduler)
+                    e2_x0 = e2_x0.clamp(-cfg.x0_latent_clip, cfg.x0_latent_clip)
+                    e2_prediction = vae.decode(
+                        (e2_x0 / vae.config.scaling_factor).to(dtype=dtype)
+                    ).sample.clamp(-1, 1)
+                    dense_mask = torch.ones_like(reciprocal_mask)
+                    loss_e2_rgb = charbonnier_loss(e2_prediction, anchor, dense_mask)
+                    loss_e2_grad = sobel_loss(e2_prediction, anchor, dense_mask)
+                    loss_e2_ssim = ssim_loss(e2_prediction, anchor)
+                    loss_e2 = (loss_e2_rgb
+                               + args.e2_gradient_weight * loss_e2_grad
+                               + args.e2_ssim_weight * loss_e2_ssim)
+                else:
+                    loss_e2_rgb = pred_a.sum() * 0
+                    loss_e2_grad = pred_a.sum() * 0
+                    loss_e2_ssim = pred_a.sum() * 0
+                    loss_e2 = pred_a.sum() * 0
                 latent_virtual_mask = F.interpolate(virtual_mask, virtual_z.shape[-2:], mode="nearest")
                 noisy_b, pred_b, _, times_b = model_pass(
-                    unet, scheduler, virtual_z, virtual_z * (1 - latent_virtual_mask),
+                    unet, scheduler, virtual_z, virtual_condition_z,
                     latent_virtual_mask, emb, cfg.reobs_max_timestep)
                 x0 = predict_x0(noisy_b, pred_b, times_b, scheduler)
                 x0 = x0.clamp(-cfg.x0_latent_clip, cfg.x0_latent_clip)
                 prediction = vae.decode((x0 / vae.config.scaling_factor).to(dtype=dtype)).sample.clamp(-1, 1)
-                loss_rgb = charbonnier_loss(prediction, reobs_rgb, reobs_mask, reobs_conf)
-                loss_grad = sobel_loss(prediction, reobs_rgb, reobs_mask, reobs_conf)
-                loss_reobs = loss_rgb + cfg.lambda_grad * loss_grad
+                loss_rgb_samples, loss_grad_samples, loss_reobs_samples = per_sample_reobs_losses(
+                    prediction, reobs_rgb, reobs_mask, reobs_conf, cfg.lambda_grad)
+                coverage, coverage_weight = reobs_coverage_weights(
+                    reobs_mask, virtual_mask,
+                    args.reobs_coverage_low, args.reobs_coverage_high)
+                loss_rgb, loss_grad = loss_rgb_samples.mean(), loss_grad_samples.mean()
+                loss_reobs = (coverage_weight * loss_reobs_samples).mean()
                 if not cfg.use_reobs_loss:
                     loss_reobs = loss_reobs * 0
                 loss_known = known_region_loss(prediction, virtual, virtual_mask)
                 if not cfg.use_known_loss:
                     loss_known = loss_known * 0
-                loss = loss_diff + cfg.lambda_reobs * loss_reobs + cfg.lambda_known * loss_known
+                loss = (loss_diff + args.lambda_e2 * loss_e2
+                        + cfg.lambda_reobs * loss_reobs + cfg.lambda_known * loss_known)
                 components = {
                     "loss_total": loss, "loss_diff_self": loss_diff,
+                    "loss_e2_exact": loss_e2, "loss_e2_rgb": loss_e2_rgb,
+                    "loss_e2_grad": loss_e2_grad, "loss_e2_ssim": loss_e2_ssim,
                     "loss_reobs_rgb": loss_rgb, "loss_reobs_grad": loss_grad,
+                    "loss_reobs_weighted": loss_reobs,
                     "loss_known": loss_known,
                 }
                 bad = [name for name, value in components.items()
@@ -180,9 +273,15 @@ def main():
             if accelerator.sync_gradients:
                 step += 1
                 metrics = {"loss_total": float(loss.detach()), "loss_diff_self": float(loss_diff.detach()),
+                    "loss_e2_exact": float(loss_e2.detach()),
+                    "loss_e2_rgb": float(loss_e2_rgb.detach()),
+                    "loss_e2_grad": float(loss_e2_grad.detach()),
+                    "loss_e2_ssim": float(loss_e2_ssim.detach()),
                     "loss_reobs_rgb": float(loss_rgb.detach()), "loss_reobs_grad": float(loss_grad.detach()),
+                    "loss_reobs_weighted": float(loss_reobs.detach()),
                     "loss_known": float(loss_known.detach()),
-                    "reobs_coverage": float((reobs_mask.sum() / virtual_mask.sum().clamp_min(1)).detach()),
+                    "reobs_coverage": float(coverage.mean().detach()),
+                    "reobs_coverage_weight": float(coverage_weight.mean().detach()),
                     "reobs_timestep_max": int(times_b.max().detach()),
                     "x0_abs_max": float(x0.detach().abs().max()),
                     "target_view_rgb_reads": 0, "target_view_depth_reads": 0}
@@ -192,7 +291,8 @@ def main():
                         handle.write(json.dumps(dict(step=step, **metrics)) + "\n")
                     if step == 1 or step % 10 == 0:
                         print("step {}/{} total={loss_total:.6f} diff={loss_diff_self:.6f} "
-                              "reobs={loss_reobs_rgb:.6f} coverage={reobs_coverage:.3f}".format(
+                              "e2={loss_e2_exact:.6f} reobs={loss_reobs_weighted:.6f} "
+                              "coverage={reobs_coverage:.3f} weight={reobs_coverage_weight:.3f}".format(
                                   step, args.steps, **metrics), flush=True)
                     if step % args.save_every == 0:
                         save_lora(unet, accelerator, output / "checkpoint-{:06d}".format(step))
