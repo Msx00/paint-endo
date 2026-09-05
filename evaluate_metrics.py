@@ -29,6 +29,8 @@ def arguments():
                    help="Evaluate submitted composites (final) or raw diffusion images")
     p.add_argument("--result-name", default="",
                    help="Model result folder below <scene>/results; inferred when unique")
+    p.add_argument("--inference-subdir", default="lcm",
+                   help="Inference folder below the result name (default: lcm)")
     return p.parse_args()
 
 def load_sample(item):
@@ -80,11 +82,12 @@ def main():
     if device.type=="cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     if args.result_name:
-        paths=sorted(outputs.glob("*/results/{}/lcm/{}/frame_*.png".format(
-            args.result_name, args.prediction_kind)))
+        paths=sorted(outputs.glob("*/results/{}/{}/{}/frame_*.png".format(
+            args.result_name, args.inference_subdir, args.prediction_kind)))
     else:
         grouped_paths=sorted(outputs.glob(
-            "*/results/*/lcm/{}/frame_*.png".format(args.prediction_kind)))
+            "*/results/*/{}/{}/frame_*.png".format(
+                args.inference_subdir, args.prediction_kind)))
         result_names={path.parents[2].name for path in grouped_paths}
         if len(result_names) > 1:
             raise RuntimeError(
@@ -159,6 +162,7 @@ def main():
         overall[key]=float(np.mean(values)) if values else None
     summary={"protocol":"native E1; Endo1 non-tool AND calibrated E2-to-E1 overlap",
       "prediction_kind":args.prediction_kind,
+      "inference_subdir":args.inference_subdir,
       "resize":"prediction bilinear-upsampled to native Endo1 GT resolution",
       "lpips":"AlexNet; invalid pixels blacked; normalize=False",
       "aggregation":"frame mean, then sequence macro-mean","device":str(device),
