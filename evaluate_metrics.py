@@ -27,21 +27,28 @@ def arguments():
     p.add_argument("--prediction-kind", choices=("final", "diffusion_raw"),
                    default="final",
                    help="Evaluate submitted composites (final) or raw diffusion images")
+    p.add_argument("--result-name", default="",
+                   help="Model result folder below <scene>/results; inferred when unique")
     return p.parse_args()
 
 def load_sample(item):
     scene, pred_path, gt_path, tool_path, overlap = item
-    with Image.open(gt_path) as image:
-        gt_image = image.convert("RGB"); size = gt_image.size
-        gt = np.asarray(gt_image, dtype=np.float32).copy() / 255.0
-    with Image.open(pred_path) as image:
-        pred_image = image.convert("RGB")
-        if pred_image.size != size:
-            pred_image = pred_image.resize(size, Image.Resampling.BILINEAR)
-        pred = np.asarray(pred_image, dtype=np.float32).copy() / 255.0
-    valid = load_valid_tissue_mask(tool_path, size) * overlap
-    return (torch.from_numpy(pred).permute(2,0,1).contiguous(),
-            torch.from_numpy(gt).permute(2,0,1).contiguous(), valid.contiguous())
+    try:
+        with Image.open(gt_path) as image:
+            gt_image = image.convert("RGB"); size = gt_image.size
+            gt = np.asarray(gt_image, dtype=np.float32).copy() / 255.0
+        with Image.open(pred_path) as image:
+            pred_image = image.convert("RGB")
+            if pred_image.size != size:
+                pred_image = pred_image.resize(size, Image.Resampling.BILINEAR)
+            pred = np.asarray(pred_image, dtype=np.float32).copy() / 255.0
+        valid = load_valid_tissue_mask(tool_path, size) * overlap
+        tensors = (torch.from_numpy(pred).permute(2,0,1).contiguous(),
+                   torch.from_numpy(gt).permute(2,0,1).contiguous(),
+                   valid.contiguous())
+        return tensors, None
+    except Exception as error:
+        return None, "{}: {}: {}".format(pred_path, type(error).__name__, error)
 
 def batch_masked_ssim(pred, gt, mask, eps=1e-8):
     channels, window_size = pred.shape[1], 11
@@ -72,13 +79,27 @@ def main():
                         else "cpu" if args.device=="auto" else args.device)
     if device.type=="cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
-    paths=sorted(outputs.glob("*/lcm/{}/frame_*.png".format(args.prediction_kind)))
+    if args.result_name:
+        paths=sorted(outputs.glob("*/results/{}/lcm/{}/frame_*.png".format(
+            args.result_name, args.prediction_kind)))
+    else:
+        grouped_paths=sorted(outputs.glob(
+            "*/results/*/lcm/{}/frame_*.png".format(args.prediction_kind)))
+        result_names={path.parents[2].name for path in grouped_paths}
+        if len(result_names) > 1:
+            raise RuntimeError(
+                "Multiple model results found: {}. Pass --result-name.".format(
+                    ", ".join(sorted(result_names))))
+        paths=grouped_paths or sorted(
+            outputs.glob("*/lcm/{}/frame_*.png".format(args.prediction_kind)))
     if not paths:
-        raise RuntimeError("No <scene>/lcm/{}/frame_*.png outputs found".format(
+        raise RuntimeError("No model inference outputs found for {}".format(
             args.prediction_kind))
     overlaps, samples, missing = {}, [], []
     for pred in paths:
-        scene=pred.parents[2].name; root=data/scene
+        scene=(pred.parents[4].name if pred.parents[3].name == "results"
+               else pred.parents[2].name)
+        root=data/scene
         gt=root/"endoscope1/L"/pred.name; tool=root/"endoscope1/toolL"/pred.name
         if not gt.is_file(): missing.append(str(gt)); continue
         # Match load_valid_tissue_mask semantics: a missing annotation means
@@ -94,11 +115,23 @@ def main():
         warnings.filterwarnings("ignore", message="You are using `torch.load`")
         lpips=LearnedPerceptualImagePatchSimilarity(
             net_type="alex", normalize=False, reduction="none").to(device).eval()
-    rows=[]; batch=max(1,args.batch_size)
+    rows=[]; corrupt=[]; batch=max(1,args.batch_size)
     pool=ThreadPoolExecutor(max_workers=max(1,args.workers))
     with torch.inference_mode(), pool:
         for start in range(0,len(samples),batch):
-            current=samples[start:start+batch]; loaded=list(pool.map(load_sample,current))
+            current=samples[start:start+batch]
+            load_results=list(pool.map(load_sample,current))
+            valid_pairs=[]
+            for item,(tensors,error) in zip(current,load_results):
+                if error is not None:
+                    corrupt.append(error)
+                    print("skipped corrupt image: {}".format(error), flush=True)
+                else:
+                    valid_pairs.append((item,tensors))
+            if not valid_pairs:
+                continue
+            current=[pair[0] for pair in valid_pairs]
+            loaded=[pair[1] for pair in valid_pairs]
             pred=torch.stack([x[0] for x in loaded]).to(device)
             gt=torch.stack([x[1] for x in loaded]).to(device)
             valid=torch.stack([x[2] for x in loaded]).to(device); mask3=valid.expand_as(pred)
@@ -113,6 +146,8 @@ def main():
                   "valid_pixels":int(valid[i].sum().cpu()),"psnr":float(psnr[i].cpu()),
                   "ssim":float(ssim[i].cpu()),"lpips":float(lpips_values[i].cpu())})
             print("evaluated {}/{}".format(min(start+len(current),len(samples)),len(samples)),flush=True)
+    if not rows:
+        raise RuntimeError("No readable prediction/ground-truth pairs found")
     with (report/"metrics.csv").open("w",newline="") as f:
         writer=csv.DictWriter(f,fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     by_scene=defaultdict(list)
@@ -128,11 +163,14 @@ def main():
       "lpips":"AlexNet; invalid pixels blacked; normalize=False",
       "aggregation":"frame mean, then sequence macro-mean","device":str(device),
       "matched_frames":len(rows),"missing_ground_truth_frames":len(missing),
+      "corrupt_or_unreadable_frames":len(corrupt),
       "frames_with_tool_mask":sum(bool(row["tool_mask"]) for row in rows),
       "frames_without_tool_mask":sum(not bool(row["tool_mask"]) for row in rows),
       "overall":overall,"scenes":scenes}
     (report/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
     (report/"missing_ground_truth.txt").write_text("\n".join(missing)+("\n" if missing else ""))
+    (report/"corrupt_images.txt").write_text(
+        "\n".join(corrupt) + ("\n" if corrupt else ""))
     print("\nPSNR: {:.6f} dB\nSSIM: {:.6f}\nLPIPS: {:.6f}\nReport: {}".format(
       overall["psnr"],overall["ssim"],overall["lpips"],report/"summary.json"))
 

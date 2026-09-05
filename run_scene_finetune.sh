@@ -10,6 +10,29 @@ OUTPUT="$(cd "$OUTPUT_ARG" && pwd -P)"
 PYTHON="${GTCOM_PYTHON:-/home/ma_sx/miniconda3/envs/foundation_stereo/bin/python3.11}"
 SCENE_NAME="$(basename "$SCENE")"
 
+model_result_name() {
+  local model_path="${DOMAIN_LORA%/}"
+  if [[ -z "$model_path" ]]; then
+    printf '%s\n' "sd15-lcm-baseline"
+    return
+  fi
+  local leaf parent
+  leaf="$(basename "$model_path")"
+  parent="$(basename "$(dirname "$model_path")")"
+  if [[ "$leaf" == checkpoint-* ]]; then
+    printf '%s__%s\n' "$parent" "$leaf"
+  else
+    printf '%s\n' "$leaf"
+  fi
+}
+
+RESULT_NAME="${RESULT_NAME:-$(model_result_name)}"
+[[ "$RESULT_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "Invalid RESULT_NAME: $RESULT_NAME" >&2
+  exit 1
+}
+RESULT_DIR="$OUTPUT/results/$RESULT_NAME"
+
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 
@@ -32,7 +55,7 @@ fi
 if [[ "${INPAINT_EXTERIOR_ONLY:-1}" == "1" ]]; then
   EXTRA_INFER+=(--inpaint-exterior-only)
 fi
-if [[ "${OVERWRITE:-0}" == "1" || "${PREPARE_OVERWRITE:-0}" == "1" ]]; then
+if [[ "${PREPARE_OVERWRITE:-0}" == "1" ]]; then
   EXTRA_PREPARE+=(--overwrite)
 fi
 if [[ "${OVERWRITE:-0}" == "1" || "${INFER_OVERWRITE:-0}" == "1" ]]; then
@@ -41,24 +64,39 @@ fi
 
 if [[ -n "${REUSE_WARP_ROOT:-}" ]]; then
   REUSE_ROOT="$(cd "$REUSE_WARP_ROOT" && pwd -P)"
-  WARP_DIR="$REUSE_ROOT/$SCENE_NAME/warps"
-  [[ -f "$WARP_DIR/warp_manifest.json" ]] || {
-    echo "Missing reusable warp manifest: $WARP_DIR/warp_manifest.json" >&2
+  WARP_DIR=""
+  for candidate in \
+      "$REUSE_ROOT/$SCENE_NAME/warps" \
+      "$REUSE_ROOT/$SCENE_NAME" \
+      "$REUSE_ROOT"; do
+    if [[ -f "$candidate/warp_manifest.json" ]]; then
+      WARP_DIR="$candidate"
+      break
+    fi
+  done
+  [[ -n "$WARP_DIR" ]] || {
+    echo "No reusable warp_manifest.json found below $REUSE_ROOT for $SCENE_NAME" >&2
     exit 1
   }
   echo "Reusing prepared warp: $WARP_DIR"
 else
   WARP_DIR="$OUTPUT/warps"
-  "$PYTHON" "$ROOT/prepare_scene.py" \
-    --scene "$SCENE" --output "$WARP_DIR" \
-    --height "${HEIGHT:-512}" --width "${WIDTH:-640}" \
-    --confidence-threshold "${CONFIDENCE_THRESHOLD:-0.2}" \
-    --seam-kernel "${SEAM_KERNEL:-7}" "${EXTRA_PREPARE[@]}"
+  if [[ -f "$WARP_DIR/warp_manifest.json" && "${PREPARE_OVERWRITE:-0}" != "1" ]]; then
+    echo "Reusing scene warp: $WARP_DIR"
+  else
+    "$PYTHON" "$ROOT/prepare_scene.py" \
+      --scene "$SCENE" --output "$WARP_DIR" \
+      --height "${HEIGHT:-512}" --width "${WIDTH:-640}" \
+      --confidence-threshold "${CONFIDENCE_THRESHOLD:-0.2}" \
+      --seam-kernel "${SEAM_KERNEL:-7}" "${EXTRA_PREPARE[@]}"
+  fi
 fi
 
+echo "Model result name: $RESULT_NAME"
+echo "Inference output: $RESULT_DIR"
 "$PYTHON" "$ROOT/infer_lcm.py" \
-  --input "$WARP_DIR" --output "$OUTPUT/lcm" \
-  --renders-dir "$OUTPUT/renders" \
+  --input "$WARP_DIR" --output "$RESULT_DIR/lcm" \
+  --renders-dir "$RESULT_DIR/renders" \
   --model "${SD15_INPAINT_MODEL:-$ROOT/models/sd15-inpainting}" \
   --lcm-lora "${LCM_LORA_MODEL:-$ROOT/models/lcm-lora-sdv1-5}" \
   --steps "${LCM_STEPS:-4}" --guidance-scale "${GUIDANCE_SCALE:-1.5}" \
